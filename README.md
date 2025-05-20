@@ -2,7 +2,7 @@
 # Jenkins CI/CD Pipeline for Spring Boot Java Application
 
 ## Overview
-### This project demonstrates a robust, secure, and automated CI/CD pipeline for a Java Spring Boot application (e.g., spring-petclinic) using Jenkins and Kubernetes.
+### This project demonstrates a robust, secure, and automated CI/CD pipeline for a Java Spring Boot application (spring-petclinic) using Jenkins and Kubernetes.
 
 #### The pipeline covers:
 - Source code checkout and build using Maven
