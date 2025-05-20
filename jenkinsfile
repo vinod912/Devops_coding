@@ -1,0 +1,131 @@
+pipeline {
+  agent none
+
+  environment {
+    VERSION = ''
+    DOCKER_IMAGE = ''
+  }
+
+  options {
+    failFast true
+    timeout(time: 30, unit: 'MINUTES')
+  }
+
+  stages {
+    stage('Checkout') {
+      agent { label 'master' }
+      steps {
+        checkout([$class: 'GitSCM', branches: [[name: '*/main']], userRemoteConfigs: [[url: 'https://github.com/spring-projects/spring-petclinic.git']]])
+        stash includes: '**', name: 'source-code'
+      }
+    }
+
+    stage('Set Version') {
+      agent { label 'slave-java' }
+      steps {
+        unstash 'source-code'
+        script {
+          VERSION = sh(script: "git describe --tags --abbrev=0 || echo 'latest'", returnStdout: true).trim()
+          env.VERSION = VERSION
+          env.DOCKER_IMAGE = "ghcr.io/devopsdemo/springboot-app:${VERSION}"
+          echo "Docker image tag set to: ${env.DOCKER_IMAGE}"
+        }
+        stash includes: '**', name: 'source-code-with-version'
+      }
+    }
+
+    stage('Build with Maven') {
+      agent { label 'slave-java' }
+      steps {
+        unstash 'source-code-with-version'
+        sh 'mvn clean package -DskipTests'
+        stash includes: '**', name: 'built-code'
+      }
+    }
+
+    stage('Run Tests') {
+      agent { label 'slave-java' }
+      steps {
+        unstash 'built-code'
+        sh 'mvn test'
+      }
+    }
+
+    stage('Static Code Analysis - SonarQube') {
+      agent { label 'slave-java' }
+      environment {
+        SONAR_TOKEN = credentials('sonarqube-token')
+      }
+      steps {
+        unstash 'built-code'
+        withSonarQubeEnv('SonarQube') {
+          sh 'mvn sonar:sonar -Dsonar.projectKey=springboot-app -Dsonar.host.url=$SONAR_HOST_URL -Dsonar.login=$SONAR_TOKEN'
+        }
+      }
+    }
+
+    stage('Docker Build & Push') {
+      agent { label 'slave-docker' }
+      steps {
+        unstash 'source-code-with-version'
+        withCredentials([string(credentialsId: 'ghcr-token', variable: 'GHCR_TOKEN')]) {
+          sh '''
+            set -e
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u devopsdemo --password-stdin
+            docker build -t $DOCKER_IMAGE .
+            docker push $DOCKER_IMAGE
+          '''
+        }
+      }
+    }
+
+    stage('Container Scan - Trivy') {
+      agent { label 'slave-docker' }
+      steps {
+        sh 'trivy image --exit-code 0 --severity HIGH,CRITICAL $DOCKER_IMAGE || true'
+      }
+    }
+
+    stage('Deploy') {
+      agent { label 'slave-k8s' }
+      steps {
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG_FILE')]) {
+          script {
+            env.KUBECONFIG = KUBECONFIG_FILE
+
+            // Replace placeholder image in manifest with actual built image tag
+            sh "sed -i 's|PLACEHOLDER_IMAGE|${DOCKER_IMAGE}|g' k8s/springboot-deployment.yaml"
+
+            // Deploy manifest
+            sh 'kubectl apply -f k8s/springboot-deployment.yaml'
+
+            // Wait for rollout and rollback on failure
+            def rolloutStatus = sh(script: 'kubectl rollout status deployment/springboot-app --timeout=120s', returnStatus: true)
+
+            if (rolloutStatus != 0) {
+              echo "Deployment failed, rolling back..."
+              sh 'kubectl rollout undo deployment/springboot-app'
+              error("Deployment failed, rolled back to previous version.")
+            } else {
+              echo "Deployment succeeded!"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      cleanWs()
+      mail to: 'team@example.com',
+           subject: "Jenkins Job '${env.JOB_NAME}' #${env.BUILD_NUMBER} - ${currentBuild.currentResult}",
+           body: """Build #${env.BUILD_NUMBER} completed with status: ${currentBuild.currentResult}
+
+Check details at: ${env.BUILD_URL}"""
+    }
+    failure {
+      echo 'Pipeline failed. Check logs.'
+    }
+  }
+}
